@@ -20,8 +20,7 @@ logging.basicConfig(level=logging.INFO)
 # Постоянная клавиатура внизу экрана
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("📋 Список"), KeyboardButton("✅ Выполнено")]],
-    resize_keyboard=True,
-    persistent=True
+    resize_keyboard=True
 )
 
 # ─── Хранилище задач ────────────────────────────────────────────────────────
