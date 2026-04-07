@@ -2,10 +2,10 @@ import logging
 import re
 from datetime import datetime, timedelta
 import pytz
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters
 )
 
 TOKEN = "8784078941:AAF_MA_s_YQIIYg9gVr7v_x_5o5NlulWT6E"
@@ -14,13 +14,26 @@ BOT_NAME = "Азим 2.0"
 
 logging.basicConfig(level=logging.INFO)
 
+# Хранилище задач: {chat_id: [{"task": str, "remind_at": datetime or None, "periodic": bool}]}
+TASKS = {}
+
+
+def get_tasks(chat_id):
+    return TASKS.get(chat_id, [])
+
+
+def add_task(chat_id, task, remind_at, periodic=False):
+    if chat_id not in TASKS:
+        TASKS[chat_id] = []
+    TASKS[chat_id].append({"task": task, "remind_at": remind_at, "periodic": periodic})
+
+
+def remove_task(chat_id, task):
+    if chat_id in TASKS:
+        TASKS[chat_id] = [t for t in TASKS[chat_id] if t["task"] != task]
+
 
 def parse_reminder(text: str):
-    """
-    Парсит задачу и время из текста.
-    Возвращает (task, remind_at или None)
-    None = бессрочная задача (напоминать каждые 4 часа с 10:00 до 23:00)
-    """
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
     remind_at = None
@@ -84,19 +97,27 @@ def parse_reminder(text: str):
     return task, remind_at
 
 
+def _next_periodic_time(now):
+    candidate = now + timedelta(minutes=1)
+    if candidate.hour < 10:
+        candidate = candidate.replace(hour=10, minute=0, second=0, microsecond=0)
+    elif candidate.hour >= 23:
+        candidate = (candidate + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    return (candidate - now).total_seconds()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Привет! Я *{BOT_NAME}* — твой личный помощник-напоминалка.\n\n"
-        "Напиши задачу со временем, и я напомню тебе за *3 часа*, *30 минут* и *5 минут* до события:\n"
-        "• купить молоко через 30 минут\n"
+        "Напиши задачу со временем — напомню за *3 часа*, *30 минут* и *5 минут*:\n"
         "• позвонить Ване завтра в 15:00\n"
         "• сдать отчёт в 18 30\n"
         "• митинг 2025-04-01 10:00\n\n"
-        "Если напишешь задачу *без времени* — буду напоминать каждые 4 часа с 10:00 до 23:00:\n"
-        "• выпить воду\n"
-        "• проверить почту\n\n"
+        "Без времени — напоминаю каждые *4 часа* с 10:00 до 23:00:\n"
+        "• выпить воду\n\n"
         "Команды:\n"
-        "/list — активные напоминания\n"
+        "/list — список всех напоминаний\n"
+        "/done — отметить задачу выполненной\n"
         "/stop — остановить все напоминания",
         parse_mode="Markdown"
     )
@@ -110,7 +131,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
 
     if remind_at:
-        # Напоминания за 3 часа, 30 минут, 5 минут и в момент события
         offsets = [
             (timedelta(hours=3), "⏰ До события *3 часа*"),
             (timedelta(minutes=30), "⚡️ До события *30 минут*"),
@@ -132,6 +152,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 scheduled.append(prefix)
 
+        add_task(chat_id, task, remind_at, periodic=False)
+
         time_str = remind_at.strftime("%d.%m.%Y в %H:%M")
         reminders_text = "\n".join(f"  {s}" for s in scheduled)
         await update.message.reply_text(
@@ -140,7 +162,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     else:
-        # Бессрочная задача — каждые 4 часа с 10:00 до 23:00
         job_name = f"periodic_{chat_id}_{task}"
         context.job_queue.run_repeating(
             send_periodic_reminder,
@@ -149,22 +170,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data={"chat_id": chat_id, "task": task},
             name=job_name
         )
+        add_task(chat_id, task, None, periodic=True)
+
         await update.message.reply_text(
             f"🔁 Запомнил как *бессрочную задачу*!\n\n📌 *{task}*\n\n"
             f"Буду напоминать каждые *4 часа* с 10:00 до 23:00.",
             parse_mode="Markdown"
         )
-
-
-def _next_periodic_time(now):
-    """Следующее время срабатывания в промежутке 10:00–23:00"""
-    tz = pytz.timezone(TIMEZONE)
-    candidate = now + timedelta(minutes=1)
-    if candidate.hour < 10:
-        candidate = candidate.replace(hour=10, minute=0, second=0, microsecond=0)
-    elif candidate.hour >= 23:
-        candidate = (candidate + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-    return (candidate - now).total_seconds()
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -185,8 +197,6 @@ async def send_periodic_reminder(context: ContextTypes.DEFAULT_TYPE):
     task = job.data["task"]
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
-
-    # Отправляем только в промежутке 10:00–23:00
     if 10 <= now.hour < 23:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -196,27 +206,109 @@ async def send_periodic_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = context.job_queue.jobs()
-    if not jobs:
+    chat_id = update.message.chat_id
+    tasks = get_tasks(chat_id)
+
+    if not tasks:
         await update.message.reply_text("📭 Активных напоминаний нет.")
         return
 
-    seen = set()
-    lines = [f"📋 *Активные напоминания ({BOT_NAME}):*\n"]
-    for job in jobs:
-        task = job.data.get("task", "")
-        if task not in seen:
-            seen.add(task)
-            icon = "🔁" if job.name and job.name.startswith("periodic") else "📌"
-            lines.append(f"{icon} {task}")
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+
+    timed = sorted([t for t in tasks if t["remind_at"]], key=lambda x: x["remind_at"])
+    periodic = [t for t in tasks if not t["remind_at"]]
+
+    lines = [f"📋 *Все напоминания ({BOT_NAME}):*\n"]
+
+    if timed:
+        lines.append("*⏰ По времени:*")
+        for i, t in enumerate(timed, 1):
+            time_str = t["remind_at"].strftime("%d.%m в %H:%M")
+            diff = t["remind_at"] - now
+            total_min = int(diff.total_seconds() / 60)
+            if total_min <= 0:
+                left = "уже прошло"
+            elif total_min < 60:
+                left = f"через {total_min} мин"
+            elif total_min < 1440:
+                left = f"через {total_min // 60} ч {total_min % 60} мин"
+            else:
+                left = f"через {total_min // 1440} д"
+            lines.append(f"{i}. 📌 *{t['task']}*\n    📅 {time_str} ({left})")
+
+    if periodic:
+        if timed:
+            lines.append("")
+        lines.append("*🔁 Бессрочные:*")
+        for i, t in enumerate(periodic, 1):
+            lines.append(f"{i}. 🔁 *{t['task']}*")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    tasks = get_tasks(chat_id)
+
+    if not tasks:
+        await update.message.reply_text("📭 Нет активных задач.")
+        return
+
+    tz = pytz.timezone(TIMEZONE)
+    timed = sorted([t for t in tasks if t["remind_at"]], key=lambda x: x["remind_at"])
+    periodic = [t for t in tasks if not t["remind_at"]]
+    all_tasks = timed + periodic
+
+    keyboard = []
+    for t in all_tasks:
+        if t["remind_at"]:
+            label = f"📌 {t['task']} ({t['remind_at'].strftime('%d.%m в %H:%M')})"
+        else:
+            label = f"🔁 {t['task']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"done_{t['task']}")])
+
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="done_cancel")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "✅ Какую задачу отметить как выполненную?",
+        reply_markup=reply_markup
+    )
+
+
+async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    if query.data == "done_cancel":
+        await query.edit_message_text("Отменено.")
+        return
+
+    task_name = query.data.replace("done_", "", 1)
+
+    # Останавливаем все джобы этой задачи
     jobs = context.job_queue.jobs()
     for job in jobs:
-        job.schedule_removal()
+        if job.data.get("task") == task_name and job.data.get("chat_id") == chat_id:
+            job.schedule_removal()
+
+    remove_task(chat_id, task_name)
+
+    await query.edit_message_text(
+        f"🎉 Задача выполнена!\n\n✅ *{task_name}*",
+        parse_mode="Markdown"
+    )
+
+
+async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    jobs = context.job_queue.jobs()
+    for job in jobs:
+        if job.data.get("chat_id") == chat_id:
+            job.schedule_removal()
+    TASKS.pop(chat_id, None)
     await update.message.reply_text("🛑 Все напоминания остановлены.")
 
 
@@ -224,7 +316,9 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_reminders))
+    app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("stop", stop_all))
+    app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print(f"{BOT_NAME} запущен!")
     app.run_polling()
