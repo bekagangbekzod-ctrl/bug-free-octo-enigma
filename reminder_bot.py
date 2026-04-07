@@ -1,5 +1,7 @@
 import logging
 import re
+import json
+import os
 from datetime import datetime, timedelta
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,11 +13,45 @@ from telegram.ext import (
 TOKEN = "8784078941:AAF_MA_s_YQIIYg9gVr7v_x_5o5NlulWT6E"
 TIMEZONE = "Asia/Tashkent"
 BOT_NAME = "Азим 2.0"
+TASKS_FILE = "tasks.json"
 
 logging.basicConfig(level=logging.INFO)
 
-# Хранилище задач: {chat_id: [{"task": str, "remind_at": datetime or None, "periodic": bool}]}
-TASKS = {}
+
+# ─── Хранилище задач (JSON файл) ───────────────────────────────────────────
+
+def load_tasks():
+    if os.path.exists(TASKS_FILE):
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # Конвертируем строки обратно в datetime
+        result = {}
+        for chat_id, tasks in raw.items():
+            result[int(chat_id)] = []
+            for t in tasks:
+                if t["remind_at"]:
+                    tz = pytz.timezone(TIMEZONE)
+                    t["remind_at"] = datetime.fromisoformat(t["remind_at"]).astimezone(tz)
+                result[int(chat_id)].append(t)
+        return result
+    return {}
+
+
+def save_tasks(tasks):
+    serializable = {}
+    for chat_id, task_list in tasks.items():
+        serializable[str(chat_id)] = []
+        for t in task_list:
+            serializable[str(chat_id)].append({
+                "task": t["task"],
+                "remind_at": t["remind_at"].isoformat() if t["remind_at"] else None,
+                "periodic": t["periodic"]
+            })
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
+TASKS = load_tasks()
 
 
 def get_tasks(chat_id):
@@ -25,13 +61,20 @@ def get_tasks(chat_id):
 def add_task(chat_id, task, remind_at, periodic=False):
     if chat_id not in TASKS:
         TASKS[chat_id] = []
-    TASKS[chat_id].append({"task": task, "remind_at": remind_at, "periodic": periodic})
+    # Не добавляем дубликат
+    existing = [t["task"] for t in TASKS[chat_id]]
+    if task not in existing:
+        TASKS[chat_id].append({"task": task, "remind_at": remind_at, "periodic": periodic})
+        save_tasks(TASKS)
 
 
 def remove_task(chat_id, task):
     if chat_id in TASKS:
         TASKS[chat_id] = [t for t in TASKS[chat_id] if t["task"] != task]
+        save_tasks(TASKS)
 
+
+# ─── Парсинг времени ────────────────────────────────────────────────────────
 
 def parse_reminder(text: str):
     tz = pytz.timezone(TIMEZONE)
@@ -39,7 +82,6 @@ def parse_reminder(text: str):
     remind_at = None
     task = text
 
-    # через N минут/часов
     m = re.search(r'через (\d+)\s*(мин|минут|час|часов|ч\b)', text, re.IGNORECASE)
     if m:
         amount = int(m.group(1))
@@ -48,7 +90,6 @@ def parse_reminder(text: str):
         remind_at = now + delta
         task = (text[:m.start()] + text[m.end():]).strip()
 
-    # завтра в HH:MM или завтра в HH MM
     if not remind_at:
         m = re.search(r'завтра\s+в\s+(\d{1,2})[:\s](\d{2})', text, re.IGNORECASE)
         if m:
@@ -56,7 +97,6 @@ def parse_reminder(text: str):
             remind_at = (now + timedelta(days=1)).replace(hour=h, minute=mi, second=0, microsecond=0)
             task = (text[:m.start()] + text[m.end():]).strip()
 
-    # сегодня в HH:MM или в HH MM или в HH:MM
     if not remind_at:
         m = re.search(r'(?:сегодня\s+)?в\s+(\d{1,2})[:\s](\d{2})', text, re.IGNORECASE)
         if m:
@@ -67,7 +107,6 @@ def parse_reminder(text: str):
             remind_at = candidate
             task = (text[:m.start()] + text[m.end():]).strip()
 
-    # YYYY-MM-DD HH:MM или DD.MM.YYYY HH:MM
     if not remind_at:
         m = re.search(r'(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4})\s+(\d{1,2}[:\s]\d{2})', text)
         if m:
@@ -78,7 +117,6 @@ def parse_reminder(text: str):
             remind_at = pytz.timezone(TIMEZONE).localize(dt)
             task = (text[:m.start()] + text[m.end():]).strip()
 
-    # просто HH MM или HH:MM без слова "в"
     if not remind_at:
         m = re.search(r'\b(\d{1,2})[:\s](\d{2})\b', text)
         if m:
@@ -105,6 +143,62 @@ def _next_periodic_time(now):
         candidate = (candidate + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
     return (candidate - now).total_seconds()
 
+
+# ─── Восстановление джобов после перезапуска ───────────────────────────────
+
+async def restore_jobs(app):
+    """Восстанавливает все активные напоминания после перезапуска бота"""
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    restored = 0
+
+    for chat_id, tasks in list(TASKS.items()):
+        for t in list(tasks):
+            task = t["task"]
+            remind_at = t["remind_at"]
+            periodic = t["periodic"]
+
+            if periodic:
+                job_name = f"periodic_{chat_id}_{task}"
+                app.job_queue.run_repeating(
+                    send_periodic_reminder,
+                    interval=timedelta(hours=4),
+                    first=_next_periodic_time(now),
+                    data={"chat_id": chat_id, "task": task},
+                    name=job_name
+                )
+                restored += 1
+
+            elif remind_at:
+                offsets = [
+                    (timedelta(hours=3), "⏰ До события *3 часа*"),
+                    (timedelta(minutes=30), "⚡️ До события *30 минут*"),
+                    (timedelta(minutes=5), "🔥 До события *5 минут*"),
+                    (timedelta(0), "🔔 *Время пришло!*"),
+                ]
+                any_scheduled = False
+                for delta, prefix in offsets:
+                    fire_at = remind_at - delta
+                    delay = (fire_at - now).total_seconds()
+                    if delay > 0:
+                        job_name = f"{chat_id}_{task}_{delta.total_seconds()}"
+                        app.job_queue.run_once(
+                            send_reminder,
+                            when=delay,
+                            data={"chat_id": chat_id, "task": task, "prefix": prefix},
+                            name=job_name
+                        )
+                        any_scheduled = True
+                        restored += 1
+
+                # Если все напоминания уже прошли — удаляем задачу
+                if not any_scheduled:
+                    remove_task(chat_id, task)
+
+    logging.info(f"Восстановлено {restored} джобов из {TASKS_FILE}")
+
+
+# ─── Хэндлеры ───────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -288,7 +382,6 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task_name = query.data.replace("done_", "", 1)
 
-    # Останавливаем все джобы этой задачи
     jobs = context.job_queue.jobs()
     for job in jobs:
         if job.data.get("task") == task_name and job.data.get("chat_id") == chat_id:
@@ -309,11 +402,12 @@ async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if job.data.get("chat_id") == chat_id:
             job.schedule_removal()
     TASKS.pop(chat_id, None)
+    save_tasks(TASKS)
     await update.message.reply_text("🛑 Все напоминания остановлены.")
 
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(restore_jobs).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_reminders))
     app.add_handler(CommandHandler("done", done_command))
