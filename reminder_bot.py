@@ -31,14 +31,34 @@ def load_tasks():
             raw = json.load(f)
         result = {}
         for chat_id, tasks in raw.items():
+            seen = set()
             result[int(chat_id)] = []
             for t in tasks:
+                if t["task"] in seen:
+                    continue
+                seen.add(t["task"])
                 if t["remind_at"]:
                     tz = pytz.timezone(TIMEZONE)
                     t["remind_at"] = datetime.fromisoformat(t["remind_at"]).astimezone(tz)
                 result[int(chat_id)].append(t)
+        # Сохраняем сразу без дублей
+        save_raw(result)
         return result
     return {}
+
+
+def save_raw(tasks):
+    serializable = {}
+    for chat_id, task_list in tasks.items():
+        serializable[str(chat_id)] = []
+        for t in task_list:
+            serializable[str(chat_id)].append({
+                "task": t["task"],
+                "remind_at": t["remind_at"].isoformat() if t["remind_at"] else None,
+                "periodic": t["periodic"]
+            })
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
 def save_tasks(tasks):
