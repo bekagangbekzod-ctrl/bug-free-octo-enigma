@@ -336,10 +336,9 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Inline кнопки удаления под списком
     keyboard = []
-    for t in all_tasks:
-        # Обрезаем название до 30 символов для кнопки
-        short = t["task"][:30]
-        keyboard.append([InlineKeyboardButton(f"✅ {short}", callback_data=f"d_{t['task'][:50]}")])
+    for i, t in enumerate(all_tasks):
+        short = t["task"][:28]
+        keyboard.append([InlineKeyboardButton(f"✅ {short}", callback_data=f"d_{i}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -364,12 +363,12 @@ async def show_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_tasks = timed + periodic
 
     keyboard = []
-    for t in all_tasks:
+    for i, t in enumerate(all_tasks):
         if t["remind_at"]:
             label = f"📌 {t['task'][:25]} ({t['remind_at'].strftime('%d.%m %H:%M')})"
         else:
             label = f"🔁 {t['task'][:30]}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"d_{t['task'][:50]}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"d_{i}")])
 
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="d_cancel")])
 
@@ -388,19 +387,22 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Отменено.")
         return
 
-    task_name = query.data[2:]  # убираем префикс "d_"
+    try:
+        idx = int(query.data[2:])  # убираем префикс "d_"
+    except ValueError:
+        await query.edit_message_text("⚠️ Ошибка.")
+        return
 
-    # Ищем полное название задачи (callback обрезан до 50 символов)
     tasks = get_tasks(chat_id)
-    full_task = None
-    for t in tasks:
-        if t["task"].startswith(task_name) or t["task"][:50] == task_name:
-            full_task = t["task"]
-            break
+    timed = sorted([t for t in tasks if t["remind_at"]], key=lambda x: x["remind_at"])
+    periodic = [t for t in tasks if not t["remind_at"]]
+    all_tasks = timed + periodic
 
-    if not full_task:
+    if idx >= len(all_tasks):
         await query.edit_message_text("⚠️ Задача не найдена.")
         return
+
+    full_task = all_tasks[idx]["task"]
 
     # Останавливаем все джобы задачи
     jobs = context.job_queue.jobs()
