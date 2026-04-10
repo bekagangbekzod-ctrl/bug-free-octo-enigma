@@ -13,7 +13,7 @@ from telegram.ext import (
 TOKEN = "8784078941:AAF_MA_s_YQIIYg9gVr7v_x_5o5NlulWT6E"
 TIMEZONE = "Asia/Tashkent"
 BOT_NAME = "Азим 2.0"
-TASKS_FILE = "tasks.json"
+TASKS_FILE = "/app/data/tasks.json"
 
 logging.basicConfig(level=logging.INFO)
 
